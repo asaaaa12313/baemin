@@ -30,6 +30,18 @@ from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from playwright_stealth import Stealth
 
+# ── User-Agent 풀 (랜덤 로테이션) ──
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+]
+
 app = FastAPI(title="배달의민족 리뷰 게시중단 자동화")
 
 app.add_middleware(
@@ -419,8 +431,10 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
         items = items[start_idx:end_idx]
 
         automation_state["total_items"] = len(items)
-        delay = int(config.get("건당 대기시간(초)", 3))
+        delay = int(config.get("건당 대기시간(초)", 5))
         max_retry = int(config.get("최대 재시도 횟수", 3))
+        batch_size = int(config.get("배치 크기(건)", 20))
+        batch_break = int(config.get("배치 휴식(초)", 120))
         headless_val = str(config.get("브라우저 표시", "FALSE")).upper()
         headless = headless_val not in ("TRUE", "1", "예", "Y")
 
@@ -434,9 +448,6 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
         # Playwright 실행
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless, slow_mo=100)
-            
-            # 봇 탐지 회피를 위한 User-Agent 설정
-            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             
             for i, item in enumerate(items):
                 if automation_state["should_stop"]:
@@ -468,10 +479,11 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                     continue
                 
                 # 매 항목마다 새로운 브라우저 컨텍스트/시크릿 창 생성 (챗봇 세션, 쿠키 초기화 목적)
+                ua = random.choice(USER_AGENTS)
                 context = await browser.new_context(
-                    viewport={"width": 1280, "height": 800}, 
+                    viewport={"width": random.randint(1200, 1400), "height": random.randint(750, 900)},
                     locale="ko-KR",
-                    user_agent=user_agent
+                    user_agent=ua
                 )
                 page = await context.new_page()
                 await Stealth().apply_stealth_async(page)
@@ -522,9 +534,16 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
 
                 # 건 간 대기
                 if i < len(items) - 1 and not automation_state["should_stop"]:
-                    wait = delay + random.uniform(0, 2)
-                    await add_log(f"  ⏳ {wait:.1f}초 대기...")
-                    await asyncio.sleep(wait)
+                    # 배치 휴식: N건마다 장시간 대기
+                    processed = i + 1
+                    if batch_size > 0 and processed % batch_size == 0:
+                        rest = batch_break + random.uniform(0, 30)
+                        await add_log(f"  ☕ {processed}건 완료 — {rest:.0f}초 배치 휴식 중...")
+                        await asyncio.sleep(rest)
+                    else:
+                        wait = delay + random.uniform(0, delay)
+                        await add_log(f"  ⏳ {wait:.1f}초 대기...")
+                        await asyncio.sleep(wait)
 
             await browser.close()
 
