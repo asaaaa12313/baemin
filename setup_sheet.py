@@ -113,9 +113,9 @@ def setup_sheet(spreadsheet_url: str):
     ws2.merge_cells("A1:C1")
     ws2.update("A3", [["설정 항목", "값", "설명"]])
     settings = [
-        ["챗봇 URL", "https://buly.kr/GZz78WH", "배달의민족 Happytalk 챗봇 URL"],
+        ["챗봇 URL", "https://design.happytalkio.com/chatting?siteId=4000000024&siteName=%EC%9A%B0%EC%95%84%ED%95%9C%ED%98%95%EC%A0%9C%EB%93%A4&categoryId=61602&divisionId=200880", "배달의민족 Happytalk 챗봇 원본 URL (단축 URL 사용 금지)"],
         ["건당 대기시간(초)", "5", "각 접수 건 사이 기본 대기 (실제: 5~10초 랜덤)"],
-        ["요소 탐지 타임아웃(초)", "10", "챗봇 버튼/메시지 대기 최대 시간"],
+        ["요소 탐지 타임아웃(초)", "15", "챗봇 버튼/메시지 대기 최대 시간"],
         ["최대 재시도 횟수", "3", "실패 시 재시도 횟수"],
         ["배치 크기(건)", "20", "N건마다 긴 휴식 (0=휴식없음)"],
         ["배치 휴식(초)", "120", "배치 휴식 시간 (실제: 120~150초 랜덤)"],

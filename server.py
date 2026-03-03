@@ -193,16 +193,30 @@ async def add_log(message: str, level: str = "info"):
     await broadcast("log", log_entry)
 
 
+async def _save_screenshot(page, item: dict, reason: str):
+    """에러 발생 시 현재 페이지 스크린샷 저장"""
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shop = item.get("shop_number", "unknown")
+        filepath = SCREENSHOT_DIR / f"{ts}_{shop}_{reason}.png"
+        await page.screenshot(path=str(filepath), full_page=True)
+        await add_log(f"  📸 스크린샷 저장: {filepath.name}", "info")
+    except Exception:
+        pass
+
+
 async def process_single_item(page, item: dict, config: dict) -> tuple:
     """단일 건 챗봇 접수 처리 (배달의민족)"""
-    timeout = int(config.get("요소 탐지 타임아웃(초)", 10)) * 1000
-    # URL 단축(buly.kr) 바이패스 — 해피톡 원본 URL 직접 접속
-    chatbot_url = config.get("챗봇 URL", "https://buly.kr/GZz78WH")
+    timeout = int(config.get("요소 탐지 타임아웃(초)", 15)) * 1000
+    # 구글 시트에 단축 URL이 설정되어 있어도 강제로 해피톡 원본 URL 직접 접속
+    # (단축 URL buly.kr 리다이렉트 2-5초 절약)
+    chatbot_url = "https://design.happytalkio.com/chatting?siteId=4000000024&siteName=%EC%9A%B0%EC%95%84%ED%95%9C%ED%98%95%EC%A0%9C%EB%93%A4&categoryId=61602&divisionId=200880"
     default_applicant = config.get("기본 신청자구분", "대표자")
     default_email = config.get("기본 이메일", "")
 
-    async def click_btn(text, wait_after=2):
-        """버튼 클릭 헬퍼"""
+    async def click_btn(text, wait_after=2, btn_timeout=None):
+        """버튼 클릭 헬퍼 (btn_timeout: 개별 타임아웃 ms, 기본=설정값)"""
+        t = btn_timeout or timeout
         try:
             btn = page.locator(
                 f"button:has-text('{text}'), "
@@ -210,12 +224,14 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
                 f"a:has-text('{text}'), "
                 f"span:has-text('{text}')"
             ).last
-            await btn.wait_for(state="visible", timeout=timeout)
+            await btn.wait_for(state="visible", timeout=t)
             await asyncio.sleep(random.uniform(0.3, 0.8))
             await btn.click()
             await asyncio.sleep(wait_after)
             return True
-        except Exception:
+        except Exception as e:
+            await add_log(f"  [디버그] '{text}' 버튼 탐지 실패: {str(e)[:60]}", "warning")
+            await _save_screenshot(page, item, f"btn_{text[:10]}")
             return False
 
     async def type_msg(text, wait_after=2):
@@ -251,14 +267,23 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
     try:
         # Step 1: 챗봇 접속
         await add_log(f"  [1/12] 챗봇 접속 중...")
-        await page.goto(chatbot_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
+        await page.goto(chatbot_url, wait_until="domcontentloaded", timeout=45000)
+        # 고정 sleep 대신 챗봇 UI가 렌더링될 때까지 동적 대기
+        try:
+            await page.wait_for_selector(
+                "button, div[role='button']",
+                state="visible", timeout=15000
+            )
+        except Exception:
+            await asyncio.sleep(5)  # 셀렉터 실패 시 fallback 대기
 
-        # Step 2: 신규상담 시작하기
+        # Step 2: 신규상담 시작하기 (원본 URL 접속 시 이미 대화 시작됨 → 없으면 스킵)
         await add_log(f"  [2/12] '신규상담 시작하기' 선택")
-        if not await click_btn("신규상담 시작하기"):
-            if not await click_btn("신규상담"):
-                return False, "❌ '신규상담 시작하기' 버튼 탐지 실패"
+        found = await click_btn("신규상담 시작하기", btn_timeout=5000)
+        if not found:
+            found = await click_btn("신규상담", btn_timeout=3000)
+        if not found:
+            await add_log(f"  [2/12] 이미 대화 시작 상태 — 스킵")
 
         # Step 3: 리뷰게시중단/리뷰케어 신청
         await add_log(f"  [3/12] '리뷰게시중단/리뷰케어 신청' 선택")
@@ -316,8 +341,10 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
         return True, "✅ 접수 완료"
 
     except PlaywrightTimeout:
+        await _save_screenshot(page, item, "timeout")
         return False, "❌ 타임아웃"
     except Exception as e:
+        await _save_screenshot(page, item, "error")
         return False, f"❌ 오류: {str(e)[:80]}"
 
 
@@ -420,7 +447,7 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
 
     try:
         # 데이터 로드
-        items, config = get_sheet_data(spreadsheet_url)
+        items, config = await asyncio.to_thread(get_sheet_data, spreadsheet_url)
         if not items:
             await add_log("⚠️ 처리할 데이터가 없습니다.", "warn")
             return
@@ -473,8 +500,9 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                     msg = f"⏭ 스킵 (누락: {', '.join(missing)})"
                     await add_log(msg, "warn")
                     automation_state["skip"] += 1
-                    update_sheet_result(spreadsheet_url, item["row"], msg,
-                                       datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    await asyncio.to_thread(
+                        update_sheet_result, spreadsheet_url, item["row"], msg,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     await broadcast("state", automation_state)
                     continue
                 
@@ -494,8 +522,15 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
 
                 for attempt in range(1, max_retry + 1):
                     if attempt > 1:
-                        await add_log(f"  🔁 재시도 {attempt}/{max_retry}...")
+                        await add_log(f"  🔁 재시도 {attempt}/{max_retry} (새 페이지)...")
                         await asyncio.sleep(delay)
+                        # 깨진 page 대신 새 page로 재시도
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                        page = await context.new_page()
+                        await Stealth().apply_stealth_async(page)
 
                     ok, msg = await process_single_item(page, item, config)
                     if ok:
@@ -505,7 +540,10 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                     else:
                         result_msg = msg
                         await add_log(f"  {msg}", "error")
-                        pass
+                        # 데이터 자체 문제는 재시도 무의미
+                        if any(kw in msg for kw in ["입력 실패", "불일치"]):
+                            await add_log(f"  ⚠️ 데이터 문제로 재시도 중단", "warn")
+                            break
 
                 if success:
                     automation_state["success"] += 1
@@ -516,7 +554,8 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
 
                 # 시트에 결과 기록
                 try:
-                    update_sheet_result(
+                    await asyncio.to_thread(
+                        update_sheet_result,
                         spreadsheet_url, item["row"], result_msg,
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     )
