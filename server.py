@@ -266,7 +266,7 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
 
     try:
         # Step 1: 챗봇 접속
-        await add_log(f"  [1/12] 챗봇 접속 중...")
+        await add_log(f"  [1/13] 챗봇 접속 중...")
         await page.goto(chatbot_url, wait_until="domcontentloaded", timeout=45000)
         # 고정 sleep 대신 챗봇 UI가 렌더링될 때까지 동적 대기
         try:
@@ -278,64 +278,70 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
             await asyncio.sleep(5)  # 셀렉터 실패 시 fallback 대기
 
         # Step 2: 신규상담 시작하기 (원본 URL 접속 시 이미 대화 시작됨 → 없으면 스킵)
-        await add_log(f"  [2/12] '신규상담 시작하기' 선택")
+        await add_log(f"  [2/13] '신규상담 시작하기' 선택")
         found = await click_btn("신규상담 시작하기", btn_timeout=5000)
         if not found:
             found = await click_btn("신규상담", btn_timeout=3000)
         if not found:
-            await add_log(f"  [2/12] 이미 대화 시작 상태 — 스킵")
+            await add_log(f"  [2/13] 이미 대화 시작 상태 — 스킵")
 
         # Step 3: 리뷰게시중단/리뷰케어 신청
-        await add_log(f"  [3/12] '리뷰게시중단/리뷰케어 신청' 선택")
+        await add_log(f"  [3/13] '리뷰게시중단/리뷰케어 신청' 선택")
         if not await click_btn("리뷰게시중단/리뷰케어 신청"):
             if not await click_btn("리뷰게시중단"):
                 return False, "❌ '리뷰게시중단/리뷰케어 신청' 버튼 탐지 실패"
 
         # Step 4: 리뷰게시중단 신청
-        await add_log(f"  [4/12] '리뷰게시중단 신청' 선택")
+        await add_log(f"  [4/13] '리뷰게시중단 신청' 선택")
         if not await click_btn("리뷰게시중단 신청"):
             return False, "❌ '리뷰게시중단 신청' 버튼 탐지 실패"
 
         # Step 5: 시작하기
-        await add_log(f"  [5/12] '시작하기' 선택")
+        await add_log(f"  [5/13] '시작하기' 선택")
         if not await click_btn("시작하기"):
             return False, "❌ '시작하기' 버튼 탐지 실패"
 
         # Step 6: 확인했어요.
-        await add_log(f"  [6/12] '확인했어요.' 선택")
+        await add_log(f"  [6/13] '확인했어요.' 선택")
         if not await click_btn("확인했어요"):
             return False, "❌ '확인했어요.' 버튼 탐지 실패"
 
         # Step 7: 가게번호 입력
-        await add_log(f"  [7/12] 가게번호 입력: {item['shop_number']}")
+        await add_log(f"  [7/13] 가게번호 입력: {item['shop_number']}")
         if not await type_msg(item["shop_number"]):
             return False, "❌ 가게번호 입력 실패"
 
         # Step 8: 리뷰번호 전체 입력
-        await add_log(f"  [8/12] 리뷰번호 입력: {item['review_numbers']}")
+        await add_log(f"  [8/13] 리뷰번호 입력: {item['review_numbers']}")
         if not await type_msg(item["review_numbers"]):
             return False, "❌ 리뷰번호 입력 실패"
 
         # Step 9: 대표자 또는 운영자 선택
         applicant = item.get("applicant_type") or default_applicant
-        await add_log(f"  [9/12] 신청자구분 선택: '{applicant}'")
+        await add_log(f"  [9/13] 신청자구분 선택: '{applicant}'")
         if not await click_btn(applicant):
             return False, f"❌ '{applicant}' 버튼 탐지 실패"
 
-        # Step 10: 이메일 입력
+        # Step 10: 전자신청서 발송 방법 선택 (이메일/문자메세지)
+        await add_log(f"  [10/13] '이메일' 발송 방식 선택")
+        if not await click_btn("이메일"):
+            if not await click_btn("문자메세지"):
+                return False, "❌ 발송 방식 버튼 탐지 실패"
+
+        # Step 11: 이메일 입력
         email = item.get("email") or default_email
-        await add_log(f"  [10/12] 이메일 입력: {email}")
+        await add_log(f"  [11/13] 이메일 입력: {email}")
         if not await type_msg(email):
             return False, "❌ 이메일 입력 실패"
 
-        # Step 11: 접수하기
-        await add_log(f"  [11/12] '접수하기' 클릭")
+        # Step 12: 접수하기
+        await add_log(f"  [12/13] '접수하기' 클릭")
         if not await click_btn("접수하기"):
             return False, "❌ '접수하기' 버튼 탐지 실패"
         await asyncio.sleep(2)
 
-        # Step 12: 완료 확인
-        await add_log(f"  [12/12] 접수 완료 확인...")
+        # Step 13: 완료 확인
+        await add_log(f"  [13/13] 접수 완료 확인...")
         await asyncio.sleep(2)
 
         return True, "✅ 접수 완료"
