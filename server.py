@@ -214,8 +214,11 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
     default_applicant = config.get("기본 신청자구분", "대표자")
     default_email = config.get("기본 이메일", "")
 
-    async def click_btn(text, wait_after=2, btn_timeout=None):
-        """버튼 클릭 헬퍼 (btn_timeout: 개별 타임아웃 ms, 기본=설정값)"""
+    async def click_btn(text, wait_after=2, btn_timeout=None, quiet=False):
+        """버튼 클릭 헬퍼
+        btn_timeout: 개별 타임아웃 ms (기본=설정값)
+        quiet=True: 미탐지가 정상인 경우(예: 신규상담 폴백) — 실패 로그·스크린샷 생략
+        """
         t = btn_timeout or timeout
         try:
             btn = page.locator(
@@ -230,8 +233,9 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
             await asyncio.sleep(wait_after)
             return True
         except Exception as e:
-            await add_log(f"  [디버그] '{text}' 버튼 탐지 실패: {str(e)[:60]}", "warning")
-            await _save_screenshot(page, item, f"btn_{text[:10]}")
+            if not quiet:
+                await add_log(f"  [디버그] '{text}' 버튼 탐지 실패: {str(e)[:60]}", "warning")
+                await _save_screenshot(page, item, f"btn_{text[:10]}")
             return False
 
     async def type_msg(text, wait_after=2):
@@ -277,13 +281,16 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
         except Exception:
             await asyncio.sleep(5)  # 셀렉터 실패 시 fallback 대기
 
-        # Step 2: 신규상담 시작하기 (원본 URL 접속 시 이미 대화 시작됨 → 없으면 스킵)
-        await add_log(f"  [2/13] '신규상담 시작하기' 선택")
-        found = await click_btn("신규상담 시작하기", btn_timeout=5000)
+        # Step 2: 신규상담 시작하기
+        #  원본 URL 직접 접속 시 챗봇이 이미 대화 시작 상태로 열림 → 이 버튼은 보통 안 뜸.
+        #  즉 "미탐지 = 정상"이므로 quiet=True 로 실패 로그·스크린샷을 남기지 않고,
+        #  타임아웃도 짧게(부재 확인용) 잡아 불필요한 대기를 줄인다.
+        await add_log(f"  [2/13] '신규상담 시작하기' 확인")
+        found = await click_btn("신규상담 시작하기", btn_timeout=2500, quiet=True)
         if not found:
-            found = await click_btn("신규상담", btn_timeout=3000)
+            found = await click_btn("신규상담", btn_timeout=1500, quiet=True)
         if not found:
-            await add_log(f"  [2/13] 이미 대화 시작 상태 — 스킵")
+            await add_log(f"  [2/13] 이미 대화 시작 상태 — 정상 진행")
 
         # Step 3: 리뷰게시중단/리뷰케어 신청
         await add_log(f"  [3/13] '리뷰게시중단/리뷰케어 신청' 선택")
@@ -340,10 +347,35 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
             return False, "❌ '접수하기' 버튼 탐지 실패"
         await asyncio.sleep(2)
 
-        # Step 13: 완료 확인
+        # Step 13: 완료/거부 확인
+        #  ⭐ 원칙: 멀쩡한 접수는 절대 실패 처리하지 않는다.
+        #  1) 완료 신호가 보이면 → 성공 (가장 확실, 거부 검사 건너뜀)
+        #  2) 완료 신호 없는데 명백한 거부 신호만 보이면 → 실패 (가게번호 불일치 등)
+        #  3) 둘 다 애매하면 → 기존처럼 성공 유지 (정상건 실패 방지가 최우선)
         await add_log(f"  [13/13] 접수 완료 확인...")
         await asyncio.sleep(2)
 
+        page_text = ""
+        try:
+            page_text = await page.inner_text("body", timeout=5000)
+        except Exception:
+            pass
+
+        # 1) 완료 신호 우선 (거부 키워드보다 먼저 — 오탐 방지)
+        done_kw = ["접수가 완료", "접수되었습니다", "접수 완료", "신청이 완료",
+                   "접수번호", "정상적으로 접수"]
+        if any(k in page_text for k in done_kw):
+            return True, "✅ 접수 완료 (완료 확인됨)"
+
+        # 2) 완료 신호가 없을 때만, 명백한 거부 신호 확인
+        #    (정상 안내문에는 안 나오는 표현만 보수적으로 선정)
+        reject_kw = ["일치하지 않", "확인되지 않", "유효하지 않", "존재하지 않", "올바르지 않"]
+        hit = next((k for k in reject_kw if k in page_text), None)
+        if hit:
+            await _save_screenshot(page, item, "rejected")
+            return False, f"❌ 접수 거부 추정 ('{hit}' 응답 감지)"
+
+        # 3) 완료·거부 신호 둘 다 불명확 → 성공 유지 (실패로 처리하지 않음)
         return True, "✅ 접수 완료"
 
     except PlaywrightTimeout:
@@ -501,6 +533,9 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                 missing = []
                 if not item["shop_number"]: missing.append("가게번호")
                 if not item["review_numbers"]: missing.append("리뷰번호")
+                # 이메일: 셀과 기본 이메일이 둘 다 비면만 스킵 (형식 체크는 안 함 — 오탐 방지)
+                if not (item.get("email") or config.get("기본 이메일", "")):
+                    missing.append("이메일")
 
                 if missing:
                     msg = f"⏭ 스킵 (누락: {', '.join(missing)})"
@@ -546,8 +581,8 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                     else:
                         result_msg = msg
                         await add_log(f"  {msg}", "error")
-                        # 데이터 자체 문제는 재시도 무의미
-                        if any(kw in msg for kw in ["입력 실패", "불일치"]):
+                        # 데이터 자체 문제(틀린 값으로 거부됨)는 재시도해도 또 거부됨 → 즉시 중단
+                        if any(kw in msg for kw in ["입력 실패", "불일치", "거부 추정"]):
                             await add_log(f"  ⚠️ 데이터 문제로 재시도 중단", "warn")
                             break
 
