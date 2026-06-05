@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -105,6 +106,11 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+def clean_id(s):
+    """순수 식별자(가게번호 등) 정규화 — 공백/전각공백/제로폭/BOM 전부 제거"""
+    return re.sub(r'[\s　​‌‍﻿]', '', str(s))
+
+
 def get_sheet_data(spreadsheet_url: str):
     """Google Sheet에서 접수 데이터 읽기"""
     gc = get_gspread_client()
@@ -120,19 +126,26 @@ def get_sheet_data(spreadsheet_url: str):
     if len(records) < 4:
         return [], {}
 
-    # 헤더는 3행 (인덱스 2)
+    # 헤더는 3행 (인덱스 2) — 컬럼 매핑이 예상과 어긋나면 경고 플래그만 (진행은 막지 않음)
+    header = records[2] if len(records) > 2 else []
+    def _hdr_has(idx, kw):
+        return len(header) > idx and kw in str(header[idx])
+    header_ok = _hdr_has(2, "가게") and _hdr_has(3, "리뷰") and _hdr_has(5, "이메일")
+
     items = []
     for i, row in enumerate(records[3:], start=4):  # 4행부터 데이터
-        if not row[2]:  # C열(가게번호)이 비어있으면 중단
+        # C열(가게번호)이 비었거나 행이 짧으면 데이터 끝으로 간주
+        if len(row) <= 2 or not row[2]:
             break
+        # 뒤쪽 셀이 빈 짧은 행도 IndexError 없이 안전하게 (있으면 값, 없으면 빈 문자열)
         items.append({
             "row": i,
-            "no": row[0] if row[0] else str(i - 3),
-            "company_name": str(row[1]).strip(),
-            "shop_number": str(row[2]).strip(),
-            "review_numbers": str(row[3]).strip(),
-            "applicant_type": str(row[4]).strip(),
-            "email": str(row[5]).strip(),
+            "no": (row[0] if len(row) > 0 and row[0] else str(i - 3)),
+            "company_name": str(row[1]).strip() if len(row) > 1 else "",
+            "shop_number": clean_id(row[2]),
+            "review_numbers": re.sub(r'^[\s　​‌‍﻿]+|[\s　​‌‍﻿]+$', '', str(row[3])) if len(row) > 3 else "",
+            "applicant_type": str(row[4]).strip() if len(row) > 4 else "",
+            "email": str(row[5]).strip() if len(row) > 5 else "",
             "status": str(row[6]).strip() if len(row) > 6 else "",
             "timestamp": str(row[7]).strip() if len(row) > 7 else "",
         })
@@ -148,6 +161,7 @@ def get_sheet_data(spreadsheet_url: str):
     except Exception:
         pass
 
+    config["_header_ok"] = header_ok
     return items, config
 
 
@@ -256,7 +270,11 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
                 await el.click(force=True, timeout=timeout)
                 await el.fill(text, timeout=timeout)
             except Exception:
-                await el.evaluate(f"node => {{ node.value = '{text}'; node.dispatchEvent(new Event('input', {{ bubbles: true }})); }}")
+                # 값을 JS 코드에 직접 박지 않고 인자로 전달 (작은따옴표·역슬래시·개행 포함 입력도 안전)
+                await el.evaluate(
+                    "(node, val) => { node.value = val; node.dispatchEvent(new Event('input', { bubbles: true })); }",
+                    text,
+                )
 
             await asyncio.sleep(0.5)
             await page.keyboard.press("Enter")
@@ -489,6 +507,10 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
         if not items:
             await add_log("⚠️ 처리할 데이터가 없습니다.", "warn")
             return
+        if not config.get("_header_ok", True):
+            await add_log("⚠️ 시트 헤더가 예상과 달라 컬럼 매핑(C=가게번호/D=리뷰번호/F=이메일)이 "
+                          "어긋났을 수 있습니다. 시트 상단 행·컬럼을 임의로 추가했는지 확인하세요. "
+                          "(진행은 계속합니다)", "warn")
 
         # 범위 필터
         start_idx = start_row - 1
@@ -513,7 +535,8 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
         # Playwright 실행
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless, slow_mo=100)
-            
+            consecutive_relaunch = 0  # 브라우저 연속 재기동 횟수 (폭주 방지용)
+
             for i, item in enumerate(items):
                 if automation_state["should_stop"]:
                     await add_log("⛔ 사용자에 의해 중지되었습니다.", "warn")
@@ -547,68 +570,109 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                     await broadcast("state", automation_state)
                     continue
                 
-                # 매 항목마다 새로운 브라우저 컨텍스트/시크릿 창 생성 (챗봇 세션, 쿠키 초기화 목적)
-                ua = random.choice(USER_AGENTS)
-                context = await browser.new_context(
-                    viewport={"width": random.randint(1200, 1400), "height": random.randint(750, 900)},
-                    locale="ko-KR",
-                    user_agent=ua
-                )
-                page = await context.new_page()
-                await Stealth().apply_stealth_async(page)
-
-                # 접수 시도
+                # 이 항목 처리 — 세션/브라우저 오류가 나도 '이 건만 실패'로 격리하고 다음 건 계속
+                context = None
+                page = None
                 success = False
                 result_msg = ""
-
-                for attempt in range(1, max_retry + 1):
-                    if attempt > 1:
-                        await add_log(f"  🔁 재시도 {attempt}/{max_retry} (새 페이지)...")
-                        await asyncio.sleep(delay)
-                        # 깨진 page 대신 새 page로 재시도
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                        page = await context.new_page()
-                        await Stealth().apply_stealth_async(page)
-
-                    ok, msg = await process_single_item(page, item, config)
-                    if ok:
-                        success = True
-                        result_msg = msg
-                        break
-                    else:
-                        result_msg = msg
-                        await add_log(f"  {msg}", "error")
-                        # 데이터 자체 문제(틀린 값으로 거부됨)는 재시도해도 또 거부됨 → 즉시 중단
-                        if any(kw in msg for kw in ["입력 실패", "불일치", "거부 추정"]):
-                            await add_log(f"  ⚠️ 데이터 문제로 재시도 중단", "warn")
-                            break
-
-                if success:
-                    automation_state["success"] += 1
-                    await add_log(f"  ✅ 접수 완료!", "success")
-                else:
-                    automation_state["fail"] += 1
-                    await add_log(f"  ❌ 최종 실패: {result_msg}", "error")
-
-                # 시트에 결과 기록
                 try:
-                    await asyncio.to_thread(
-                        update_sheet_result,
-                        spreadsheet_url, item["row"], result_msg,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    # 매 항목마다 새 시크릿 세션 (챗봇 쿠키 초기화 목적)
+                    ua = random.choice(USER_AGENTS)
+                    context = await browser.new_context(
+                        viewport={"width": random.randint(1200, 1400), "height": random.randint(750, 900)},
+                        locale="ko-KR",
+                        user_agent=ua
                     )
-                except Exception as e:
-                    await add_log(f"  ⚠️ 시트 결과 기록 실패: {e}", "warn")
+                    page = await context.new_page()
+                    await Stealth().apply_stealth_async(page)
 
-                await broadcast("state", automation_state)
+                    for attempt in range(1, max_retry + 1):
+                        if attempt > 1:
+                            await add_log(f"  🔁 재시도 {attempt}/{max_retry} (새 세션)...")
+                            await asyncio.sleep(delay)
+                            # 같은 쿠키로 재시도하면 챗봇이 '진행 중 상담'으로 인식 → context까지 새로 생성
+                            try:
+                                await page.close()
+                                await context.close()
+                            except Exception:
+                                pass
+                            ua = random.choice(USER_AGENTS)
+                            context = await browser.new_context(
+                                viewport={"width": random.randint(1200, 1400), "height": random.randint(750, 900)},
+                                locale="ko-KR",
+                                user_agent=ua
+                            )
+                            page = await context.new_page()
+                            await Stealth().apply_stealth_async(page)
+
+                        ok, msg = await process_single_item(page, item, config)
+                        if ok:
+                            success = True
+                            result_msg = msg
+                            break
+                        else:
+                            result_msg = msg
+                            await add_log(f"  {msg}", "error")
+                            # 데이터 자체 문제(틀린 값으로 거부됨)는 재시도해도 또 거부됨 → 즉시 중단
+                            if any(kw in msg for kw in ["입력 실패", "불일치", "거부 추정"]):
+                                await add_log(f"  ⚠️ 데이터 문제로 재시도 중단", "warn")
+                                break
+
+                    if success:
+                        automation_state["success"] += 1
+                        await add_log(f"  ✅ 접수 완료!", "success")
+                        consecutive_relaunch = 0  # 정상 성공 시 재기동 카운터 리셋
+                    else:
+                        automation_state["fail"] += 1
+                        await add_log(f"  ❌ 최종 실패: {result_msg}", "error")
+
+                    # 시트에 결과 기록
+                    try:
+                        await asyncio.to_thread(
+                            update_sheet_result,
+                            spreadsheet_url, item["row"], result_msg,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                    except Exception as e:
+                        await add_log(f"  ⚠️ 시트 결과 기록 실패: {e}", "warn")
+
+                    await broadcast("state", automation_state)
+
+                except Exception as e:
+                    # 이 항목만 실패로 격리 — 전체 루프는 멈추지 않고 다음 건으로 진행
+                    automation_state["fail"] += 1
+                    emsg = str(e)[:120]
+                    await add_log(f"  ❌ 브라우저 세션 오류 (이 건만 실패, 다음 진행): {emsg}", "error")
+                    try:
+                        await asyncio.to_thread(
+                            update_sheet_result, spreadsheet_url, item["row"],
+                            f"❌ 브라우저 세션 오류: {emsg[:60]}",
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        pass
+                    await broadcast("state", automation_state)
+                    # 브라우저 프로세스 자체가 죽었으면 1회 재기동 (연속 3회 초과 시 자동화 중단)
+                    if not browser.is_connected():
+                        consecutive_relaunch += 1
+                        if consecutive_relaunch > 3:
+                            await add_log("💥 브라우저 재기동 3회 초과 — 자동화를 중단합니다.", "error")
+                            break
+                        await add_log(f"  🔄 브라우저 재기동 ({consecutive_relaunch}/3)...", "warn")
+                        try:
+                            browser = await p.chromium.launch(headless=headless, slow_mo=100)
+                        except Exception as relaunch_err:
+                            await add_log(f"💥 브라우저 재기동 실패 — 중단: {str(relaunch_err)[:80]}", "error")
+                            break
                 
-                # 시크릿 창 닫기
+                # 시크릿 창 닫기 (page/context 독립 정리 — 한쪽 실패가 다른쪽 정리를 막지 않게)
                 try:
-                    await page.close()
-                    await context.close()
+                    if page is not None:
+                        await page.close()
+                except Exception:
+                    pass
+                try:
+                    if context is not None:
+                        await context.close()
                 except Exception:
                     pass
 
