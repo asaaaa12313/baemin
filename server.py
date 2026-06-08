@@ -165,16 +165,29 @@ def get_sheet_data(spreadsheet_url: str):
     return items, config
 
 
+# 결과 기록용 워크시트 캐시 (URL당 1회만 open → 매 건 open_by_url/worksheet 호출에 의한 읽기 429 차단)
+_worksheet_cache = {}
+
+
+def _get_result_worksheet(spreadsheet_url: str):
+    """결과 기록용 워크시트를 캐싱해서 반환 (없으면 1회만 열어서 저장)"""
+    ws = _worksheet_cache.get(spreadsheet_url)
+    if ws is None:
+        gc = get_gspread_client()
+        sh = gc.open_by_url(spreadsheet_url)
+        try:
+            ws = sh.worksheet("접수데이터")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.sheet1
+        _worksheet_cache[spreadsheet_url] = ws
+    return ws
+
+
 def update_sheet_result(spreadsheet_url: str, row: int, status: str, timestamp: str):
-    """Google Sheet에 결과 기록 (H열, I열)"""  
-    gc = get_gspread_client()
-    sh = gc.open_by_url(spreadsheet_url)
-    try:
-        ws = sh.worksheet("접수데이터")
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.sheet1
-    ws.update_cell(row, 7, status)     # G열
-    ws.update_cell(row, 8, timestamp)  # H열
+    """Google Sheet에 결과 기록 (G열=처리결과, H열=처리시간)"""  
+    ws = _get_result_worksheet(spreadsheet_url)
+    # update_cell 2회 대신 G:H를 한 번에 기록 (읽기·쓰기 요청 모두 절감)
+    ws.update(range_name=f"G{row}:H{row}", values=[[status, timestamp]])
 
 
 # ============================================================
@@ -226,7 +239,6 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
     # (단축 URL buly.kr 리다이렉트 2-5초 절약)
     chatbot_url = "https://design.happytalkio.com/chatting?siteId=4000000024&siteName=%EC%9A%B0%EC%95%84%ED%95%9C%ED%98%95%EC%A0%9C%EB%93%A4&categoryId=61602&divisionId=200880"
     default_applicant = config.get("기본 신청자구분", "대표자")
-    default_email = config.get("기본 이메일", "")
 
     async def click_btn(text, wait_after=2, btn_timeout=None, quiet=False):
         """버튼 클릭 헬퍼
@@ -288,7 +300,7 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
 
     try:
         # Step 1: 챗봇 접속
-        await add_log(f"  [1/13] 챗봇 접속 중...")
+        await add_log(f"  [1/12] 챗봇 접속 중...")
         await page.goto(chatbot_url, wait_until="domcontentloaded", timeout=45000)
         # 고정 sleep 대신 챗봇 UI가 렌더링될 때까지 동적 대기
         try:
@@ -303,74 +315,70 @@ async def process_single_item(page, item: dict, config: dict) -> tuple:
         #  원본 URL 직접 접속 시 챗봇이 이미 대화 시작 상태로 열림 → 이 버튼은 보통 안 뜸.
         #  즉 "미탐지 = 정상"이므로 quiet=True 로 실패 로그·스크린샷을 남기지 않고,
         #  타임아웃도 짧게(부재 확인용) 잡아 불필요한 대기를 줄인다.
-        await add_log(f"  [2/13] '신규상담 시작하기' 확인")
+        await add_log(f"  [2/12] '신규상담 시작하기' 확인")
         found = await click_btn("신규상담 시작하기", btn_timeout=2500, quiet=True)
         if not found:
             found = await click_btn("신규상담", btn_timeout=1500, quiet=True)
         if not found:
-            await add_log(f"  [2/13] 이미 대화 시작 상태 — 정상 진행")
+            await add_log(f"  [2/12] 이미 대화 시작 상태 — 정상 진행")
 
         # Step 3: 리뷰게시중단/리뷰케어 신청
-        await add_log(f"  [3/13] '리뷰게시중단/리뷰케어 신청' 선택")
+        await add_log(f"  [3/12] '리뷰게시중단/리뷰케어 신청' 선택")
         if not await click_btn("리뷰게시중단/리뷰케어 신청"):
             if not await click_btn("리뷰게시중단"):
                 return False, "❌ '리뷰게시중단/리뷰케어 신청' 버튼 탐지 실패"
 
         # Step 4: 리뷰게시중단 신청
-        await add_log(f"  [4/13] '리뷰게시중단 신청' 선택")
+        await add_log(f"  [4/12] '리뷰게시중단 신청' 선택")
         if not await click_btn("리뷰게시중단 신청"):
             return False, "❌ '리뷰게시중단 신청' 버튼 탐지 실패"
 
         # Step 5: 시작하기
-        await add_log(f"  [5/13] '시작하기' 선택")
+        await add_log(f"  [5/12] '시작하기' 선택")
         if not await click_btn("시작하기"):
             return False, "❌ '시작하기' 버튼 탐지 실패"
 
         # Step 6: 확인했어요.
-        await add_log(f"  [6/13] '확인했어요.' 선택")
+        await add_log(f"  [6/12] '확인했어요.' 선택")
         if not await click_btn("확인했어요"):
             return False, "❌ '확인했어요.' 버튼 탐지 실패"
 
         # Step 7: 가게번호 입력
-        await add_log(f"  [7/13] 가게번호 입력: {item['shop_number']}")
+        await add_log(f"  [7/12] 가게번호 입력: {item['shop_number']}")
         if not await type_msg(item["shop_number"]):
             return False, "❌ 가게번호 입력 실패"
 
         # Step 8: 리뷰번호 전체 입력
-        await add_log(f"  [8/13] 리뷰번호 입력: {item['review_numbers']}")
+        await add_log(f"  [8/12] 리뷰번호 입력: {item['review_numbers']}")
         if not await type_msg(item["review_numbers"]):
             return False, "❌ 리뷰번호 입력 실패"
 
         # Step 9: 대표자 또는 운영자 선택
         applicant = item.get("applicant_type") or default_applicant
-        await add_log(f"  [9/13] 신청자구분 선택: '{applicant}'")
+        await add_log(f"  [9/12] 신청자구분 선택: '{applicant}'")
         if not await click_btn(applicant):
             return False, f"❌ '{applicant}' 버튼 탐지 실패"
 
         # Step 10: 전자신청서 발송 방법 선택 (이메일/문자메세지)
-        await add_log(f"  [10/13] '이메일' 발송 방식 선택")
+        #  실측: 발송방식 선택 후 챗봇은 이메일 주소를 받지 않고 곧장 [접수하기]로 이동.
+        #  → '이메일 주소 입력' 단계 없음 (값을 넣으면 입력창에 끼어들어 흐름이 깨짐).
+        await add_log(f"  [10/12] '이메일' 발송 방식 선택")
         if not await click_btn("이메일"):
             if not await click_btn("문자메세지"):
                 return False, "❌ 발송 방식 버튼 탐지 실패"
 
-        # Step 11: 이메일 입력
-        email = item.get("email") or default_email
-        await add_log(f"  [11/13] 이메일 입력: {email}")
-        if not await type_msg(email):
-            return False, "❌ 이메일 입력 실패"
-
-        # Step 12: 접수하기
-        await add_log(f"  [12/13] '접수하기' 클릭")
+        # Step 11: 접수하기
+        await add_log(f"  [11/12] '접수하기' 클릭")
         if not await click_btn("접수하기"):
             return False, "❌ '접수하기' 버튼 탐지 실패"
         await asyncio.sleep(2)
 
-        # Step 13: 완료/거부 확인
+        # Step 12: 완료/거부 확인
         #  ⭐ 원칙: 멀쩡한 접수는 절대 실패 처리하지 않는다.
         #  1) 완료 신호가 보이면 → 성공 (가장 확실, 거부 검사 건너뜀)
         #  2) 완료 신호 없는데 명백한 거부 신호만 보이면 → 실패 (가게번호 불일치 등)
         #  3) 둘 다 애매하면 → 기존처럼 성공 유지 (정상건 실패 방지가 최우선)
-        await add_log(f"  [13/13] 접수 완료 확인...")
+        await add_log(f"  [12/12] 접수 완료 확인...")
         await asyncio.sleep(2)
 
         page_text = ""
@@ -497,6 +505,7 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
         "skip": 0,
         "logs": [],
     })
+    _worksheet_cache.clear()  # 이전 실행의 캐시 워크시트 무효화 (시트 구조 변경 대비)
 
     await add_log("🚀 자동화를 시작합니다...")
     await broadcast("state", automation_state)
@@ -556,17 +565,17 @@ async def run_automation(spreadsheet_url: str, start_row: int, end_row: int):
                 missing = []
                 if not item["shop_number"]: missing.append("가게번호")
                 if not item["review_numbers"]: missing.append("리뷰번호")
-                # 이메일: 셀과 기본 이메일이 둘 다 비면만 스킵 (형식 체크는 안 함 — 오탐 방지)
-                if not (item.get("email") or config.get("기본 이메일", "")):
-                    missing.append("이메일")
 
                 if missing:
                     msg = f"⏭ 스킵 (누락: {', '.join(missing)})"
                     await add_log(msg, "warn")
                     automation_state["skip"] += 1
-                    await asyncio.to_thread(
-                        update_sheet_result, spreadsheet_url, item["row"], msg,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    try:
+                        await asyncio.to_thread(
+                            update_sheet_result, spreadsheet_url, item["row"], msg,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    except Exception as e:
+                        await add_log(f"  ⚠️ 시트 결과 기록 실패(스킵 건): {e}", "warn")
                     await broadcast("state", automation_state)
                     continue
                 
